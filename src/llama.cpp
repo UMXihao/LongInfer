@@ -3448,6 +3448,7 @@ static bool llama_kv_cache_init(
     const int64_t  n_layer = hparams.n_layer;
 
     cache.has_shift = false;
+    cache.size = kv_size;
 
     cache.recurrent = llama_model_is_recurrent(&model);
     cache.v_trans   = !cache.recurrent && !cparams.flash_attn;
@@ -16624,6 +16625,38 @@ struct llm_build_context {
     }
 };
 
+float importance_evaluate(ggml_tensor* q_l, ggml_tensor* k_l) {
+    int d_head = k_l->ne[0];              // 每个 head 的 embedding 维度
+    int num_heads = k_l->ne[1];           // head 的数量
+    int tokens_per_page = 32;             // 超参数：每个 page 的 token 数量
+    float score = 0.0f;
+
+    // 处理 FP16 格式的 K
+    const ggml_fp16_t * k_data = (const ggml_fp16_t *) k_l->data;
+    const ggml_fp16_t * q_data = (const ggml_fp16_t *) q_l->data;
+
+    for (int h = 0; h < num_heads; ++h) {  // 遍历所有 head
+        std::vector<float> max_vals(d_head, -std::numeric_limits<float>::infinity());
+
+        // 遍历 d_head 维度，找到每列（channel）的最大值
+        for (int d = 0; d < d_head; ++d) {
+            for (int t = 0; t < tokens_per_page; ++t) {
+                int idx = h * k_l->nb[1] / sizeof(ggml_fp16_t) + d * k_l->nb[0] / sizeof(ggml_fp16_t) + t;
+                float k_val = ggml_fp16_to_fp32(k_data[idx]);  // FP16 -> FP32
+                max_vals[d] = std::max(max_vals[d], k_val);
+            }
+        }
+
+        // 计算 Query 和 max_vals 的 element-wise product 并累加到 score
+        for (int d = 0; d < d_head; ++d) {
+            int q_idx = h * q_l->nb[1] / sizeof(ggml_fp16_t) + d;
+            float q_val = ggml_fp16_to_fp32(q_data[q_idx]);  // FP16 -> FP32
+            score += std::abs(max_vals[d] * q_val);
+        }
+    }
+    return score;
+}
+
 static struct ggml_cgraph * llama_build_graph_defrag(llama_context & lctx, const std::vector<uint32_t> & ids) {
     llama_ubatch dummy = {};
     dummy.equal_seqs = true;
@@ -17623,20 +17656,6 @@ static int llama_decode_internal(
 
         // non-causal masks do not use the KV cache
         if (hparams.causal_attn) {
-            // llama_kv_cache_update(&lctx);
-
-            // if we have enough unused cells before the current head ->
-            //   better to start searching from the beginning of the cache, hoping to fill it
-            if (kv_self.head > kv_self.used + 2*n_tokens) {
-                kv_self.head = 0;
-            }
-
-            const auto slot = llama_kv_cache_find_slot(kv_self, ubatch);
-            if (!slot) {
-                return 1;
-            }
-            kv_slot_restorer.save(slot);
-
             if (!kv_self.recurrent) {
                 // a heuristic, to avoid attending the full cache if it is not yet utilized
                 // after enough generations, the benefit from this heuristic disappears
@@ -17646,8 +17665,6 @@ static int llama_decode_internal(
                 //kv_self.n = llama_kv_cache_cell_max(kv_self);
             }
         }
-
-        //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
 
         ggml_backend_sched_reset(lctx.sched.get());
         ggml_backend_sched_set_eval_callback(lctx.sched.get(), lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
@@ -19925,7 +19942,8 @@ struct llama_context * llama_new_context_with_model(
 
             // buffer used to store the computation graph and the tensor meta data
             ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
-
+            LLAMA_LOG_INFO("%s: max_nodes     = %u\n",   __func__, max_nodes);
+            LLAMA_LOG_INFO("%s: ctx->buf_compute_meta     = %u\n",   __func__, ctx->buf_compute_meta.size());
             // TODO: move these checks to ggml_backend_sched
             // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
             bool pipeline_parallel =
