@@ -3458,7 +3458,7 @@ static bool llama_kv_cache_init(
 
     cache.pages.clear();
     const uint32_t page_size = 32; // TODO Set to hparam
-    const uint32_t page_num = (kv_size + page_size - 1) / page_size;
+    const uint32_t page_num = kv_size / page_size;
     cache.pages.resize(page_num);
 
     // 初始化每个页面并分配到 GPU 或 CPU
@@ -19942,8 +19942,6 @@ struct llama_context * llama_new_context_with_model(
 
             // buffer used to store the computation graph and the tensor meta data
             ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
-            LLAMA_LOG_INFO("%s: max_nodes     = %u\n",   __func__, max_nodes);
-            LLAMA_LOG_INFO("%s: ctx->buf_compute_meta     = %u\n",   __func__, ctx->buf_compute_meta.size());
             // TODO: move these checks to ggml_backend_sched
             // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
             bool pipeline_parallel =
