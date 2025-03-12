@@ -2795,7 +2795,14 @@ struct llama_kv_cell {
     }
 };
 
-// ring-buffer of cached KV data
+struct llama_kv_page {
+    uint32_t page_id;                  // 页面 ID
+    std::vector<uint32_t> tokens;      // token
+    float importance;                  // 页面的重要性评分
+    bool is_on_gpu;                    // 页面是否分配在 GPU 上
+};
+
+// page-buffer of cached KV data
 struct llama_kv_cache {
     bool has_shift = false;
     bool do_defrag = false;
@@ -2816,9 +2823,14 @@ struct llama_kv_cache {
     ggml_type type_v = GGML_TYPE_F16;
 
     std::vector<llama_kv_cell> cells;
+    uint32_t page_size = 32;
+    std::vector<llama_kv_page> pages;
 
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
+
+    std::vector<struct ggml_tensor *> k_l_cpu; // per layer
+    std::vector<struct ggml_tensor *> v_l_cpu;
 
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -3439,19 +3451,34 @@ static bool llama_kv_cache_init(
     const int64_t  n_layer = hparams.n_layer;
 
     cache.has_shift = false;
+    cache.size = kv_size;
 
     cache.recurrent = llama_model_is_recurrent(&model);
     cache.v_trans   = !cache.recurrent && !cparams.flash_attn;
 
-    cache.head = 0;
-    cache.size = kv_size;
-    cache.used = 0;
-
     cache.type_k = type_k;
     cache.type_v = type_v;
 
-    cache.cells.clear();
-    cache.cells.resize(kv_size);
+    cache.pages.clear();
+    const uint32_t page_size = 32; // TODO Set to hparam
+    const uint32_t page_num = (kv_size + page_size - 1) / page_size;
+    cache.pages.resize(page_num);
+
+    // 初始化每个页面并分配到 GPU 或 CPU
+    const float gpu_compute_rate = 0.3; // TODO Set to hparam
+    uint32_t num_gpu_pages = static_cast<int>(std::ceil(page_num * gpu_compute_rate));  // 向上取整并转换为整数
+    uint32_t num_cpu_pages = page_num - num_gpu_pages;
+
+    // 初始化每个页面
+    for (uint32_t i = 0; i < page_num; i++) {
+        cache.pages[i].page_id = i;
+        cache.pages[i].importance = 0.0f; // 初始重要性评分为 0
+        if (i < num_gpu_pages) {
+            cache.pages[i].is_on_gpu = true;
+        } else {
+            cache.pages[i].is_on_gpu = false;
+        }
+    }
 
     // create a context for each buffer type
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
@@ -3482,25 +3509,36 @@ static bool llama_kv_cache_init(
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
 
         ggml_backend_buffer_type_t buft;
+        // 默认的kv缓存位置
         if (offload) {
             auto * dev = model.dev_layer.at(i).dev;
             buft = ggml_backend_dev_buffer_type(dev);
         } else {
             buft = ggml_backend_cpu_buffer_type();
         }
-        ggml_context * ctx = ctx_for_buft(buft);
 
+        ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
             LLAMA_LOG_ERROR("%s: failed to create ggml context for kv cache\n", __func__);
             return false;
         }
-
-        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*kv_size);
-        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*kv_size);
+        LLAMA_LOG_INFO("%s: layer: %u, page_size: %u\n", __func__);
+        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa * kv_size);
+        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa * kv_size);
         ggml_format_name(k, "cache_k_l%d", i);
         ggml_format_name(v, "cache_v_l%d", i);
         cache.k_l.push_back(k);
         cache.v_l.push_back(v);
+
+        // 用于传输的cpu buffer缓冲区
+        ggml_backend_buffer_type_t buft_cpu = ggml_backend_cpu_buffer_type();
+        ggml_context * ctx_cpu = ctx_for_buft(buft_cpu);
+        ggml_tensor * k_c = ggml_new_tensor_1d(ctx_cpu, type_k, n_embd_k_gqa * kv_size);
+        ggml_tensor * v_c = ggml_new_tensor_1d(ctx_cpu, type_v, n_embd_v_gqa * kv_size);
+        ggml_format_name(k_c, "cache_k_c%d", i);
+        ggml_format_name(v_c, "cache_v_c%d", i);
+        cache.k_l.push_back(k_c);
+        cache.v_l.push_back(v_c);
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -16596,6 +16634,38 @@ struct llm_build_context {
     }
 };
 
+float importance_evaluate(ggml_tensor* q_l, ggml_tensor* k_l) {
+    int d_head = k_l->ne[0];              // 每个 head 的 embedding 维度
+    int num_heads = k_l->ne[1];           // head 的数量
+    int tokens_per_page = 32;             // 超参数：每个 page 的 token 数量
+    float score = 0.0f;
+
+    // 处理 FP16 格式的 K
+    const ggml_fp16_t * k_data = (const ggml_fp16_t *) k_l->data;
+    const ggml_fp16_t * q_data = (const ggml_fp16_t *) q_l->data;
+
+    for (int h = 0; h < num_heads; ++h) {  // 遍历所有 head
+        std::vector<float> max_vals(d_head, -std::numeric_limits<float>::infinity());
+
+        // 遍历 d_head 维度，找到每列（channel）的最大值
+        for (int d = 0; d < d_head; ++d) {
+            for (int t = 0; t < tokens_per_page; ++t) {
+                int idx = h * k_l->nb[1] / sizeof(ggml_fp16_t) + d * k_l->nb[0] / sizeof(ggml_fp16_t) + t;
+                float k_val = ggml_fp16_to_fp32(k_data[idx]);  // FP16 -> FP32
+                max_vals[d] = std::max(max_vals[d], k_val);
+            }
+        }
+
+        // 计算 Query 和 max_vals 的 element-wise product 并累加到 score
+        for (int d = 0; d < d_head; ++d) {
+            int q_idx = h * q_l->nb[1] / sizeof(ggml_fp16_t) + d;
+            float q_val = ggml_fp16_to_fp32(q_data[q_idx]);  // FP16 -> FP32
+            score += std::abs(max_vals[d] * q_val);
+        }
+    }
+    return score;
+}
+
 static struct ggml_cgraph * llama_build_graph_defrag(llama_context & lctx, const std::vector<uint32_t> & ids) {
     llama_ubatch dummy = {};
     dummy.equal_seqs = true;
@@ -17595,20 +17665,6 @@ static int llama_decode_internal(
 
         // non-causal masks do not use the KV cache
         if (hparams.causal_attn) {
-            llama_kv_cache_update(&lctx);
-
-            // if we have enough unused cells before the current head ->
-            //   better to start searching from the beginning of the cache, hoping to fill it
-            if (kv_self.head > kv_self.used + 2*n_tokens) {
-                kv_self.head = 0;
-            }
-
-            const auto slot = llama_kv_cache_find_slot(kv_self, ubatch);
-            if (!slot) {
-                return 1;
-            }
-            kv_slot_restorer.save(slot);
-
             if (!kv_self.recurrent) {
                 // a heuristic, to avoid attending the full cache if it is not yet utilized
                 // after enough generations, the benefit from this heuristic disappears
@@ -17618,8 +17674,6 @@ static int llama_decode_internal(
                 //kv_self.n = llama_kv_cache_cell_max(kv_self);
             }
         }
-
-        //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
 
         ggml_backend_sched_reset(lctx.sched.get());
         ggml_backend_sched_set_eval_callback(lctx.sched.get(), lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
@@ -19897,7 +19951,6 @@ struct llama_context * llama_new_context_with_model(
 
             // buffer used to store the computation graph and the tensor meta data
             ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
-
             // TODO: move these checks to ggml_backend_sched
             // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
             bool pipeline_parallel =
