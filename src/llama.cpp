@@ -2795,6 +2795,13 @@ struct llama_kv_cell {
     }
 };
 
+struct llama_kv_page {
+    uint32_t page_id;                  // 页面 ID
+    std::vector<uint32_t> tokens;      // token
+    float importance;                  // 页面的重要性评分
+    bool is_on_gpu;                    // 页面是否分配在 GPU 上
+};
+
 // ring-buffer of cached KV data
 struct llama_kv_cache {
     bool has_shift = false;
@@ -2816,6 +2823,9 @@ struct llama_kv_cache {
     ggml_type type_v = GGML_TYPE_F16;
 
     std::vector<llama_kv_cell> cells;
+
+    uint32_t page_size = 32;
+    std::vector<llama_kv_page> pages;
 
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
