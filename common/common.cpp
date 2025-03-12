@@ -868,7 +868,7 @@ struct common_init_result common_init_from_params(common_params & params) {
 
     auto cparams = common_context_params_to_llama(params);
 
-    LOG_INF("%s: Start to create context with model", __func__);
+    LOG_INF("%s: Start to create context with model\n", __func__);
     llama_context * lctx = llama_new_context_with_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.c_str());
@@ -881,7 +881,7 @@ struct common_init_result common_init_from_params(common_params & params) {
         llama_free_model(model);
         return iparams;
     }
-    LOG_INF("%s: Finish llama_kv_cache_can_shift", __func__);
+    LOG_INF("%s: Finish llama_kv_cache_can_shift\n", __func__);
     if (!params.control_vectors.empty()) {
         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_n_layer(model);
