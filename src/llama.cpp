@@ -20010,7 +20010,6 @@ struct llama_context * llama_new_context_with_model(
                 llama_free(ctx);
                 return nullptr;
             }
-            LLAMA_LOG_INFO("%s: graph nodes  = %zu\n", __func__, backend_ptrs.size());
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 ggml_backend_t backend = backend_ptrs[i];
                 ggml_backend_buffer_type_t buft = backend_buft[i];
