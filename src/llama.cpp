@@ -2829,6 +2829,9 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
 
+    std::vector<struct ggml_tensor *> k_l_cpu; // per layer
+    std::vector<struct ggml_tensor *> v_l_cpu;
+
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
@@ -3458,7 +3461,7 @@ static bool llama_kv_cache_init(
 
     cache.pages.clear();
     const uint32_t page_size = 32; // TODO Set to hparam
-    const uint32_t page_num = kv_size / page_size;
+    const uint32_t page_num = (kv_size + page_size - 1) / page_size;
     cache.pages.resize(page_num);
 
     // 初始化每个页面并分配到 GPU 或 CPU
@@ -3505,31 +3508,37 @@ static bool llama_kv_cache_init(
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i) + hparams.n_embd_k_s();
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
 
-        // 根据页面分配比例，将 key 和 value 张量分配到 GPU 或 CPU
-        for (uint32_t page_id = 0; page_id < page_num; page_id++) {
-            ggml_backend_buffer_type_t buft;
-            if (cache.pages[page_id].is_on_gpu) {
-                // 分配到 GPU
-                auto * dev = model.dev_layer.at(i).dev;
-                buft = ggml_backend_dev_buffer_type(dev);
-            } else {
-                // 分配到 CPU
-                buft = ggml_backend_cpu_buffer_type();
-            }
-
-            ggml_context * ctx = ctx_for_buft(buft);
-            if (!ctx) {
-                LLAMA_LOG_ERROR("%s: failed to create ggml context for kv cache\n", __func__);
-                return false;
-            }
-
-            ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa * cache.page_size);
-            ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa * cache.page_size);
-            ggml_format_name(k, "cache_k_l%d_page%d", i, page_id);
-            ggml_format_name(v, "cache_v_l%d_page%d", i, page_id);
-            cache.k_l.push_back(k);
-            cache.v_l.push_back(v);
+        ggml_backend_buffer_type_t buft;
+        // 默认的kv缓存位置
+        if (offload) {
+            auto * dev = model.dev_layer.at(i).dev;
+            buft = ggml_backend_dev_buffer_type(dev);
+        } else {
+            buft = ggml_backend_cpu_buffer_type();
         }
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to create ggml context for kv cache\n", __func__);
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: layer: %u, page_size: %u\n", __func__);
+        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa * kv_size);
+        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa * kv_size);
+        ggml_format_name(k, "cache_k_l%d", i);
+        ggml_format_name(v, "cache_v_l%d", i);
+        cache.k_l.push_back(k);
+        cache.v_l.push_back(v);
+
+        // 用于传输的cpu buffer缓冲区
+        ggml_backend_buffer_type_t buft_cpu = ggml_backend_cpu_buffer_type();
+        ggml_context * ctx_cpu = ctx_for_buft(buft_cpu);
+        ggml_tensor * k_c = ggml_new_tensor_1d(ctx_cpu, type_k, n_embd_k_gqa * kv_size);
+        ggml_tensor * v_c = ggml_new_tensor_1d(ctx_cpu, type_v, n_embd_v_gqa * kv_size);
+        ggml_format_name(k_c, "cache_k_c%d", i);
+        ggml_format_name(v_c, "cache_v_c%d", i);
+        cache.k_l.push_back(k_c);
+        cache.v_l.push_back(v_c);
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
