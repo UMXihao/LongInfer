@@ -3522,7 +3522,6 @@ static bool llama_kv_cache_init(
             LLAMA_LOG_ERROR("%s: failed to create ggml context for kv cache\n", __func__);
             return false;
         }
-        LLAMA_LOG_INFO("%s: layer: %u, page_size: %u\n", __func__);
         ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa * kv_size);
         ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa * kv_size);
         ggml_format_name(k, "cache_k_l%d", i);
@@ -20011,7 +20010,7 @@ struct llama_context * llama_new_context_with_model(
                 llama_free(ctx);
                 return nullptr;
             }
-
+            LLAMA_LOG_INFO("%s: graph nodes  = %zu\n", __func__, backend_ptrs.size());
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 ggml_backend_t backend = backend_ptrs[i];
                 ggml_backend_buffer_type_t buft = backend_buft[i];
