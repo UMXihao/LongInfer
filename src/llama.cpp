@@ -10730,6 +10730,7 @@ struct llm_build_context {
     }
 
     struct ggml_cgraph * build_llama() {
+        LLAMA_LOG_INFO("ggml_new_graph_custom\n");
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
 
         // mutable variable, needed during the last layer of the computation to skip unused tokens
@@ -10741,15 +10742,15 @@ struct llm_build_context {
 
         struct ggml_tensor * cur;
         struct ggml_tensor * inpL;
-
+        LLAMA_LOG_INFO("llm_build_inp_embd\n");
         inpL = llm_build_inp_embd(ctx0, lctx, hparams, ubatch, model.tok_embd, cb);
-
+        LLAMA_LOG_INFO("build_inp_pos\n");
         // inp_pos - contains the positions
         struct ggml_tensor * inp_pos = build_inp_pos();
-
+        LLAMA_LOG_INFO("build_inp_KQ_mask\n");
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
         struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
-
+        LLAMA_LOG_INFO("llm_build_norm\n");
         const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;

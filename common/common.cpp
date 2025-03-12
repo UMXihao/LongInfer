@@ -875,7 +875,7 @@ struct common_init_result common_init_from_params(common_params & params) {
         llama_free_model(model);
         return iparams;
     }
-    LOG_INF("%s: Finish create context with model", __func__);
+    LOG_INF("%s: Finish create context with model\n", __func__);
     if (params.ctx_shift && !llama_kv_cache_can_shift(lctx)) {
         LOG_ERR("%s: KV cache shifting is not supported for this model (--no-context-shift to disable)'\n", __func__);
         llama_free_model(model);
