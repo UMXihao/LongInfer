@@ -14004,6 +14004,7 @@ struct llama_context * llama_new_context_with_model(
                     ggml_backend_buffer_get_size(ctx->buf_output.get()) / 1024.0 / 1024.0);
         }
 
+        LLAMA_LOG_INFO("%s: start to scheduler and compute buffers\n", __func__);
         // scheduler and compute buffers
         {
             // buffer types used for the compute buffer of each backend
@@ -14023,7 +14024,7 @@ struct llama_context * llama_new_context_with_model(
                 backend_buft.push_back(buft);
                 backend_ptrs.push_back(backend.get());
             }
-
+            LLAMA_LOG_INFO("%s: start to apply buffer resource.\n", __func__);
             const size_t max_nodes = llama_model_max_nodes(*model);
 
             // buffer used to store the computation graph and the tensor meta data
@@ -14080,7 +14081,7 @@ struct llama_context * llama_new_context_with_model(
             ggml_backend_sched_reserve(ctx->sched.get(), gf_tg);
             int n_splits_tg = ggml_backend_sched_get_n_splits(ctx->sched.get());
             int n_nodes_tg = ggml_graph_n_nodes(gf_tg);
-
+            LLAMA_LOG_INFO("%s: start to llama_build_graph\n", __func__);
             // reserve again with pp graph to avoid ggml-alloc reallocations during inference
             gf_pp = llama_build_graph(*ctx, ubatch_pp, true);
             if (!ggml_backend_sched_reserve(ctx->sched.get(), gf_pp)) {
@@ -14088,6 +14089,7 @@ struct llama_context * llama_new_context_with_model(
                 llama_free(ctx);
                 return nullptr;
             }
+            LLAMA_LOG_INFO("%s: start to backend buffers %zu\n", __func__, backend_ptrs.size());
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 ggml_backend_t backend = backend_ptrs[i];
                 ggml_backend_buffer_type_t buft = backend_buft[i];
