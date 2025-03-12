@@ -10699,6 +10699,65 @@ struct llm_build_context {
         return lctx.inp_KQ_mask_cross;
     }
 
+    // LongInfer
+    void kv_resort(ggml_tensor *k_cur, ggml_tensor *q_cur, int il, const llama_kv_cache & kv){
+        // 從第二層開始進行稀疏處理
+        if (il < 2) {
+            return;
+        }
+        // 對page大小的kv cache進行重要性計算
+        // 每32個進行kv cache的稀疏性分析
+        const int64_t page_size = 32;
+        // 當前總共應該有多少kv進行page分析
+        const int64_t page_num = (kv.n + page_size - 1) / page_size;
+
+        // LLAMA_LOG_INFO("%s: current kv size %u page_num %ld\n", __func__, kv.n, page_num);
+        const int64_t n_embd = k_cur->ne[0]; // embd size
+        const int64_t n_seq = k_cur->ne[1]; // token size
+
+        // get data index
+        float *k_data = (float *)k_cur->data;
+        float *q_data = (float *)q_cur->data;
+
+        int count = 0;
+        if (count < 1) {
+            float *temp_data = ggml_get_data_f32(k_cur);
+            LLAMA_LOG_INFO("%s: what's this? %d\n", __func__, temp_data);
+            count++;
+        }
+
+        // allocate space for page weights
+        std::vector<float> page_weights(page_num, 0.0f);
+
+        // LLAMA_LOG_INFO("%s: n_dim %ld n_head %ld\n", __func__, k_cur->ne[0], k_cur->ne[1]);
+
+        // for (int64_t p = 0; p < page_num; ++p) {
+        //     float k_value_max = -SIZE_MAX*0.1;
+        //     float k_value_min = SIZE_MAX*0.1;
+        //     float temp_value = 0.0;
+        //     for (int64_t e = 0; e < n_embd; ++e){
+        //         for (int64_t s = p*page_size; s < (p+1)*page_size; s++) {
+        //             // 根据步长计算索引
+        //             if (s < n_seq){
+        //                 int64_t k_index = `
+        //                 LLAMA_LOG_ERROR("%s: in for loop 5: %d and %d\n",__func__,k_cur->nb[0],k_cur->nb[1]);
+        //                 //ERROR!!
+        //                 LLAMA_LOG_ERROR("%s: k_index = %d, k_data[k_index] = %lf",__func__, k_index, k_data[k_index]);
+        //                 k_value_max = std::max(k_data[k_index], k_value_max);
+        //                 k_value_min = std::min(k_data[k_index], k_value_min);
+        //             }
+        //         }
+        //         for (int64_t s = p*page_size; s < (p+1)*page_size; s++) {//token for Q
+        //             if (s < n_seq){
+        //                 int64_t q_index = e * q_cur->nb[0] + s * q_cur->nb[1];
+        //                 temp_value += std::max(q_data[q_index]*k_value_max,q_data[q_index]*k_value_min);
+        //             }
+        //         }
+        //     }
+        //     page_weights.push_back(temp_value);
+        // }
+    }
+
     struct ggml_cgraph * build_llama() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
 
@@ -10770,6 +10829,9 @@ struct llm_build_context {
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
+
+                // 識別是解碼階段進行page重要性分析
+                kv_resort(Kcur, Qcur, il, kv_self);
 
                 cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
