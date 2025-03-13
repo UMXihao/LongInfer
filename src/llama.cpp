@@ -2830,6 +2830,9 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
 
+    std::vector<struct ggml_tensor *> k_l_cpu; // per layer
+    std::vector<struct ggml_tensor *> v_l_cpu;
+
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
@@ -3505,12 +3508,23 @@ static bool llama_kv_cache_init(
             return false;
         }
 
+        // TODO GPU percent
+        int temp = (int)ceilf(kv_size * 0.3);
         ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*kv_size);
         ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*kv_size);
         ggml_format_name(k, "cache_k_l%d", i);
         ggml_format_name(v, "cache_v_l%d", i);
         cache.k_l.push_back(k);
         cache.v_l.push_back(v);
+
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+        ggml_context * ctx_cpu = ctx_for_buft(cpu_buft);
+        ggml_tensor * k_cpu = ggml_new_tensor_1d(ctx_cpu, type_k, n_embd_k_gqa*kv_size);
+        ggml_tensor * v_cpu = ggml_new_tensor_1d(ctx_cpu, type_v, n_embd_v_gqa*kv_size);
+        ggml_format_name(k_cpu, "cache_k_l_c%d", i);
+        ggml_format_name(v_cpu, "cache_v_l_c%d", i);
+        cache.k_l_cpu.push_back(k_cpu);
+        cache.v_l_cpu.push_back(v_cpu);
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -9438,6 +9452,8 @@ static void llm_build_kv_store(
     struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa)*kv_head);
     cb(k_cache_view, "k_cache_view", il);
 
+    // TODO 将30%张量存储到kv.k_l[il]， 70%存储到kv.k_l_cpu[il]
+
     // note: storing RoPE-ed version of K in the KV cache
     ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur, k_cache_view));
 
@@ -9772,6 +9788,54 @@ static struct ggml_tensor * llm_build_moe_ffn(
     return moe_out;
 }
 
+// LongInfer
+static void kv_resort(struct ggml_context * ctx, struct ggml_cgraph * graph, ggml_tensor *k_cur, ggml_tensor *q_cur, int il, const llama_kv_cache & kv) {
+    // 從第二層開始進行稀疏處理
+    if (il >= 2) {
+        // k_cur dim 128 n_kv 32 1
+        // q_cur dim 128 1 32 1
+        const int64_t dim_head = q_cur->ne[0];
+        const int64_t sen_len = q_cur->ne[1];
+        const int64_t i2 = q_cur->ne[2];
+        // const int64_t i3 = q_cur->ne[3];
+        // LLAMA_LOG_INFO("%s: q_cur size dim_head %ld, num_head%ld, i2 %ld, i3 %ld\n", __func__, dim_head, num_head, i2, i3);
+
+        // 如果i2的维度是1，说明是解码阶段，仅有解码阶段进行计算
+        if (sen_len == 1) {
+            // 對page大小的kv cache進行重要性計算
+            // 每32個進行kv cache的稀疏性分析
+            const int64_t page_size = 32;
+            // 當前總共應該有多少kv進行page分析
+            const int64_t page_num = (kv.n + page_size - 1) / page_size;
+
+            // Q转为1为数组
+            ggml_tensor * query = ggml_reshape_1d(ctx, q_cur, dim_head * i2);
+            ggml_build_forward_expand(graph, q_cur);
+
+            // 遍历前面所有的kv cache，进行重要性计算,调用新增的ggml算子
+            for (int64_t i = 0; i < kv.n; i=i+page_size) {
+                // 每隔page_size，选择其中的最大值，作为新的张量
+                ggml_tensor * key_matrix = get_page_key(ctx, k_cur, i, page_size);
+                // page_num个张量
+
+                // 计算K和Q的点积和存入map
+                ggml_tensor* dot_result = ggml_mul(ctx, query, key_matrix);
+
+                // 求和：result = sum(C)
+                ggml_tensor* result = ggml_sum(ctx, dot_result);
+
+                ggml_build_forward_expand(graph, key_matrix);
+                ggml_build_forward_expand(graph, dot_result);
+                ggml_build_forward_expand(graph, result);
+
+                // 获取结果
+                // float dot_product = ggml_get_f32_1d(result, 0);
+                // printf("Dot product: %f\n", dot_product);
+            }
+        }
+    }
+}
+
 static struct ggml_tensor * llm_build_kqv(
         struct ggml_context * ctx,
        struct llama_context & lctx,
@@ -9800,6 +9864,12 @@ static struct ggml_tensor * llm_build_kqv(
 
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     cb(q, "q", il);
+
+    kv_resort(ctx, graph, kv.k_l[il], q, il, kv);
+
+    // 0矩阵验证
+    // 重新设置kv.k_l[il]和kv.v_l[il]参与当前K和V的运算，并且将其余kv转移到CPU
+    // 判断是解码阶段才进行参数转移
 
     struct ggml_tensor * k =
         ggml_view_3d(ctx, kv.k_l[il],
@@ -10699,65 +10769,6 @@ struct llm_build_context {
         return lctx.inp_KQ_mask_cross;
     }
 
-    // LongInfer
-    void kv_resort(ggml_tensor *k_cur, ggml_tensor *q_cur, int il, const llama_kv_cache & kv){
-        // 從第二層開始進行稀疏處理
-        if (il < 2) {
-            return;
-        }
-        // 對page大小的kv cache進行重要性計算
-        // 每32個進行kv cache的稀疏性分析
-        const int64_t page_size = 32;
-        // 當前總共應該有多少kv進行page分析
-        const int64_t page_num = (kv.n + page_size - 1) / page_size;
-
-        // LLAMA_LOG_INFO("%s: current kv size %u page_num %ld\n", __func__, kv.n, page_num);
-        const int64_t n_embd = k_cur->ne[0]; // embd size
-        const int64_t n_seq = k_cur->ne[1]; // token size
-
-        // get data index
-        float *k_data = (float *)k_cur->data;
-        float *q_data = (float *)q_cur->data;
-
-        int count = 0;
-        if (count < 1) {
-            float *temp_data = ggml_get_data_f32(k_cur);
-            LLAMA_LOG_INFO("%s: what's this? %d\n", __func__, temp_data);
-            count++;
-        }
-
-        // allocate space for page weights
-        std::vector<float> page_weights(page_num, 0.0f);
-
-        // LLAMA_LOG_INFO("%s: n_dim %ld n_head %ld\n", __func__, k_cur->ne[0], k_cur->ne[1]);
-
-        // for (int64_t p = 0; p < page_num; ++p) {
-        //     float k_value_max = -SIZE_MAX*0.1;
-        //     float k_value_min = SIZE_MAX*0.1;
-        //     float temp_value = 0.0;
-        //     for (int64_t e = 0; e < n_embd; ++e){
-        //         for (int64_t s = p*page_size; s < (p+1)*page_size; s++) {
-        //             // 根据步长计算索引
-        //             if (s < n_seq){
-        //                 int64_t k_index = `
-        //                 LLAMA_LOG_ERROR("%s: in for loop 5: %d and %d\n",__func__,k_cur->nb[0],k_cur->nb[1]);
-        //                 //ERROR!!
-        //                 LLAMA_LOG_ERROR("%s: k_index = %d, k_data[k_index] = %lf",__func__, k_index, k_data[k_index]);
-        //                 k_value_max = std::max(k_data[k_index], k_value_max);
-        //                 k_value_min = std::min(k_data[k_index], k_value_min);
-        //             }
-        //         }
-        //         for (int64_t s = p*page_size; s < (p+1)*page_size; s++) {//token for Q
-        //             if (s < n_seq){
-        //                 int64_t q_index = e * q_cur->nb[0] + s * q_cur->nb[1];
-        //                 temp_value += std::max(q_data[q_index]*k_value_max,q_data[q_index]*k_value_min);
-        //             }
-        //         }
-        //     }
-        //     page_weights.push_back(temp_value);
-        // }
-    }
-
     struct ggml_cgraph * build_llama() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
 
@@ -10829,9 +10840,6 @@ struct llm_build_context {
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
-
-                // 識別是解碼階段進行page重要性分析
-                kv_resort(Kcur, Qcur, il, kv_self);
 
                 cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
