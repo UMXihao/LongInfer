@@ -40,6 +40,8 @@ extern "C" {
     GGML_BACKEND_API struct ggml_tensor * ggml_set_i32 (struct ggml_tensor * tensor, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_set_f32 (struct ggml_tensor * tensor, float value);
 
+    GGML_BACKEND_API struct ggml_tensor * get_page_key (struct ggml_context * ctx, const struct ggml_tensor * tensor, int index, int page_size);
+
     GGML_BACKEND_API int32_t ggml_get_i32_1d(const struct ggml_tensor * tensor, int i);
     GGML_BACKEND_API void    ggml_set_i32_1d(const struct ggml_tensor * tensor, int i, int32_t value);
 

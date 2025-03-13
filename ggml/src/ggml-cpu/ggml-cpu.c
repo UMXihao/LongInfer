@@ -2623,6 +2623,49 @@ struct ggml_tensor * ggml_set_f32(struct ggml_tensor * tensor, float value) {
     return tensor;
 }
 
+struct ggml_tensor * get_page_key(
+        struct ggml_context * ctx,
+        const struct ggml_tensor * tensor,
+        int      index,
+        int page_size) {
+    // 获取输入张量的维度信息
+    const int64_t ne0 = tensor->ne[0];  // 128
+    const int64_t ne1 = tensor->ne[1];  // n_kv
+    const int64_t ne2 = tensor->ne[2];  // 32
+    const int64_t ne3 = tensor->ne[3];  // 1
+
+    // 创建目标张量，形状为 (4096, 1, 1, 1)
+    struct ggml_tensor* output = ggml_new_tensor_1d(ctx, tensor->type, ne0*ne2);
+
+    // 复制数据
+    for (int i1 = index; i1 < index + page_size; ++i1) {
+        struct ggml_tensor* temp = ggml_new_tensor_4d(ctx, tensor->type, ne0, 1, ne2, ne3);
+        for (int i3 = 0; i3 < ne3; ++i3) {      // 遍历最外层维度（1）
+            for (int i2 = 0; i2 < ne2; ++i2) {  // 遍历第三维度（32）
+                for (int i0 = 0; i0 < ne0; ++i0) {
+                    // 从输入张量中读取数据
+                    const float value = ggml_get_f32_nd(tensor, i0, i1, i2, i3);
+                    // 写入目标张量
+                    ggml_set_f32_nd(temp, i0, 0, i2, i3, value);
+                }
+            }
+        }
+        temp = ggml_new_tensor_1d(ctx, tensor->type, ne0*ne2);
+        // 遍历当前列的每一行
+        for (int row = 0; row < ne0*ne2; ++row) {
+            float val = ggml_get_f32_1d(temp, row);  // 获取当前元素的值
+            float max_val = ggml_get_f32_1d(output, row);  // 获取当前元素的值
+            if (val > max_val) {
+                max_val = val;  // 更新最大值
+            }
+            // 将当前列的最大值存储到输出张量中
+            ggml_set_f32_1d(output, row, max_val);
+        }
+    }
+
+    return output;
+}
+
 int32_t ggml_get_i32_1d(const struct ggml_tensor * tensor, int i) {
     if (!ggml_is_contiguous(tensor)) {
         int64_t id[4] = { 0, 0, 0, 0 };
