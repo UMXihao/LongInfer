@@ -8801,7 +8801,9 @@ static void ggml_compute_forward_get_kv_mask_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int nr = ggml_nrows(src0);
+    const int nr  = ggml_nrows(src0);
+
+    GGML_TENSOR_UNARY_OP_LOCALS
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -8810,9 +8812,15 @@ static void ggml_compute_forward_get_kv_mask_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    const int n_embd = src0->ne[0]; // 4096
-    const int n_kv = src0->ne[1]; // kv_size
+    for (int ir = ir0; ir < ir1; ++ir) {
+        // src1 is broadcastable across src0 and dst in i1, i2, i3
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
 
+        float * src0_ptr = (float *) ((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+        * src0_ptr = 0;
+    }
 }
 
 // ggml_compute_forward_diag_mask_inf
