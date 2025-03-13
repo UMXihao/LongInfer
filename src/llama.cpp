@@ -3509,7 +3509,7 @@ static bool llama_kv_cache_init(
         }
 
         // TODO GPU percent
-        int temp = (int)ceilf(kv_size * 0.3);
+        // int temp = (int)ceilf(kv_size * 0.3);
         ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*kv_size);
         ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*kv_size);
         ggml_format_name(k, "cache_k_l%d", i);
@@ -9452,6 +9452,8 @@ static void llm_build_kv_store(
     struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa)*kv_head);
     cb(k_cache_view, "k_cache_view", il);
 
+    // 重新设置kv.k_l[il]和kv.v_l[il]参与当前K和V的运算，并且将其余kv转移到CPU
+    // 判断是解码阶段才进行参数转移
     // TODO 将30%张量存储到kv.k_l[il]， 70%存储到kv.k_l_cpu[il]
 
     // note: storing RoPE-ed version of K in the KV cache
@@ -9789,51 +9791,59 @@ static struct ggml_tensor * llm_build_moe_ffn(
 }
 
 // LongInfer
-static void kv_resort(struct ggml_context * ctx, struct ggml_cgraph * graph, ggml_tensor *k_cur, ggml_tensor *q_cur, int il, const llama_kv_cache & kv) {
+static std::pair<ggml_tensor*, ggml_tensor*> kv_resort(struct ggml_context * ctx, struct ggml_cgraph * graph, const llama_hparams & hparams, int32_t n_kv,
+    ggml_tensor *q_cur, ggml_tensor *k_cur, ggml_tensor *v_cur,
+    const llm_build_cb & cb, int il, const llama_kv_cache & kv) {
     // 從第二層開始進行稀疏處理
-    if (il >= 2) {
-        // k_cur dim 128 n_kv 32 1
-        // q_cur dim 128 1 32 1
-        const int64_t dim_head = q_cur->ne[0];
-        const int64_t sen_len = q_cur->ne[1];
-        const int64_t i2 = q_cur->ne[2];
-        // const int64_t i3 = q_cur->ne[3];
-        // LLAMA_LOG_INFO("%s: q_cur size dim_head %ld, num_head%ld, i2 %ld, i3 %ld\n", __func__, dim_head, num_head, i2, i3);
-
-        // 如果i2的维度是1，说明是解码阶段，仅有解码阶段进行计算
-        if (sen_len == 1) {
-            // 對page大小的kv cache進行重要性計算
-            // 每32個進行kv cache的稀疏性分析
-            const int64_t page_size = 32;
-            // 當前總共應該有多少kv進行page分析
-            const int64_t page_num = (kv.n + page_size - 1) / page_size;
-
-            // Q转为1为数组
-            ggml_tensor * query = ggml_reshape_1d(ctx, q_cur, dim_head * i2);
-            ggml_build_forward_expand(graph, q_cur);
-
-            // 遍历前面所有的kv cache，进行重要性计算,调用新增的ggml算子
-            for (int64_t i = 0; i < kv.n; i=i+page_size) {
-                // 每隔page_size，选择其中的最大值，作为新的张量
-                ggml_tensor * key_matrix = get_page_key(ctx, k_cur, i, page_size);
-                // page_num个张量
-
-                // 计算K和Q的点积和存入map
-                ggml_tensor* dot_result = ggml_mul(ctx, query, key_matrix);
-
-                // 求和：result = sum(C)
-                ggml_tensor* result = ggml_sum(ctx, dot_result);
-
-                ggml_build_forward_expand(graph, key_matrix);
-                ggml_build_forward_expand(graph, dot_result);
-                ggml_build_forward_expand(graph, result);
-
-                // 获取结果
-                // float dot_product = ggml_get_f32_1d(result, 0);
-                // printf("Dot product: %f\n", dot_product);
-            }
-        }
+    if (il <= 2) {
+        return {nullptr, nullptr};
     }
+    // q_cur dim 128 32 sen_len 1
+    const int64_t ne0_query = q_cur->ne[0];
+    const int64_t ne1_query = q_cur->ne[1];
+    const int64_t ne2_query = q_cur->ne[2]; // sen_len or token_num
+    // const int64_t ne3_query = q_cur->ne[3];
+    // LLAMA_LOG_INFO("%s: query size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_query, ne1_query, ne2_query, ne3_query);
+    if (ne2_query != 1) {
+        // 如果sen_len的维度是1，说明是解码阶段，仅有解码阶段进行计算
+        return {nullptr, nullptr};
+    }
+
+    // Q转为1为数组
+    ggml_tensor *query = ggml_reshape_1d(ctx, q_cur, ne0_query * ne1_query);
+    cb(query, "query", il);
+    // ggml_build_forward_expand(graph, q_cur);
+
+    const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+    const int64_t n_head_kv = hparams.n_head_kv(il);
+    const int64_t n_embd_head_k = hparams.n_embd_head_k;
+    struct ggml_tensor *key_matrix = ggml_view_2d(ctx, kv.k_l[il],
+                                                  n_embd_head_k * n_head_kv, n_kv,
+                                                  ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa), 0);
+    cb(key_matrix, "key_matrix", il);
+
+    // key_matrix dim 4096 n_kv 1 1
+    // const int64_t ne0_key = key_matrix->ne[0];
+    // const int64_t ne1_key = key_matrix->ne[1];
+    // const int64_t ne2_key = key_matrix->ne[2];
+    // const int64_t ne3_key = key_matrix->ne[3];
+    // LLAMA_LOG_INFO("%s: key_matrix size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_key, ne1_key, ne2_key, ne3_key);
+
+    // 计算K和Q的点积, (4096,n_kv,1,1) . (4096,1,1,1)
+    ggml_tensor *result = ggml_mul(ctx, key_matrix, query);
+    // const int64_t ne0_result = result->ne[0];
+    // const int64_t ne1_result = result->ne[1];
+    // const int64_t ne2_result = result->ne[2];
+    // const int64_t ne3_result = result->ne[3];
+    // LLAMA_LOG_INFO("%s: result size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_result, ne1_result, ne2_result, ne3_result);
+    ggml_build_forward_expand(graph, result);
+
+    // result已經計算完4096*n_kv，現在要對n_kv進行page_size劃分，然後對原始的K和V進行掩碼處理
+    int page_size = 32;
+    ggml_tensor *mask_kv = ggml_get_kv_mask(ctx, result, page_size);
+    return {nullptr, nullptr};
+    // 對原始的KV進行掩碼處理
+    // return {ggml_mask_kv(ctx, mask_kv, k_cur), ggml_mask_kv(ctx, mask_kv, v_cur)};
 }
 
 static struct ggml_tensor * llm_build_kqv(
@@ -9864,12 +9874,6 @@ static struct ggml_tensor * llm_build_kqv(
 
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     cb(q, "q", il);
-
-    kv_resort(ctx, graph, kv.k_l[il], q, il, kv);
-
-    // 0矩阵验证
-    // 重新设置kv.k_l[il]和kv.v_l[il]参与当前K和V的运算，并且将其余kv转移到CPU
-    // 判断是解码阶段才进行参数转移
 
     struct ggml_tensor * k =
         ggml_view_3d(ctx, kv.k_l[il],
@@ -9992,7 +9996,12 @@ static struct ggml_tensor * llm_build_kv(
     ggml_build_forward_expand(graph, k_cur);
     ggml_build_forward_expand(graph, v_cur);
 
-    llm_build_kv_store(ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
+    std::pair<ggml_tensor*, ggml_tensor*> mask_kv = kv_resort(ctx, graph,hparams, n_kv, q_cur, k_cur, v_cur, cb, il, kv);
+    if (mask_kv.first && mask_kv.second) {
+        llm_build_kv_store(ctx, hparams, cparams, kv, graph, mask_kv.first, mask_kv.second, n_tokens, kv_head, cb, il);
+    } else {
+        llm_build_kv_store(ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
+    }
 
     struct ggml_tensor * cur;
 
@@ -11750,7 +11759,7 @@ static int llama_decode_internal(
 
         // non-causal masks do not use the KV cache
         if (hparams.causal_attn) {
-            llama_kv_cache_update(&lctx);
+            // llama_kv_cache_update(&lctx);
 
             // if we have enough unused cells before the current head ->
             //   better to start searching from the beginning of the cache, hoping to fill it

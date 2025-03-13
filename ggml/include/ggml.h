@@ -482,6 +482,8 @@ extern "C" {
         GGML_OP_DIAG,
         GGML_OP_DIAG_MASK_INF,
         GGML_OP_DIAG_MASK_ZERO,
+        GGML_OP_GET_KV_MASK,
+        // GGML_OP_MASK_KV,
         GGML_OP_SOFT_MAX,
         GGML_OP_SOFT_MAX_BACK,
         GGML_OP_ROPE,
@@ -1368,6 +1370,11 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   n_past);
+
+    GGML_API struct ggml_tensor * ggml_get_kv_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   page_size);
 
     // in-place, returns view(a)
     GGML_API struct ggml_tensor * ggml_diag_mask_zero_inplace(
