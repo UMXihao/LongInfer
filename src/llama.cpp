@@ -9791,36 +9791,34 @@ static struct ggml_tensor * llm_build_moe_ffn(
 }
 
 // LongInfer
-static std::pair<ggml_tensor*, ggml_tensor*> kv_resort(struct ggml_context * ctx, struct ggml_cgraph * graph, const llama_hparams & hparams, int32_t n_kv,
+static std::pair<ggml_tensor*, ggml_tensor*> kv_resort(struct ggml_context * ctx, struct ggml_cgraph * graph,
     ggml_tensor *q_cur, ggml_tensor *k_cur, ggml_tensor *v_cur,
     const llm_build_cb & cb, int il, const llama_kv_cache & kv) {
     // 從第二層開始進行稀疏處理
     if (il <= 2) {
         return {nullptr, nullptr};
     }
-    // q_cur dim 128 32 sen_len 1
+    // q_cur dim 128 sen_len 32 1
     const int64_t ne0_query = q_cur->ne[0];
     const int64_t ne1_query = q_cur->ne[1];
     const int64_t ne2_query = q_cur->ne[2]; // sen_len or token_num
     // const int64_t ne3_query = q_cur->ne[3];
     // LLAMA_LOG_INFO("%s: query size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_query, ne1_query, ne2_query, ne3_query);
-    if (ne2_query != 1) {
+    if (ne1_query != 1) {
         // 如果sen_len的维度是1，说明是解码阶段，仅有解码阶段进行计算
         return {nullptr, nullptr};
     }
 
     // Q转为1为数组
-    ggml_tensor *query = ggml_reshape_1d(ctx, q_cur, ne0_query * ne1_query);
+    ggml_tensor *query = ggml_reshape_1d(ctx, q_cur, ne0_query * ne2_query);
     cb(query, "query", il);
-    // ggml_build_forward_expand(graph, q_cur);
 
-    const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-    const int64_t n_head_kv = hparams.n_head_kv(il);
-    const int64_t n_embd_head_k = hparams.n_embd_head_k;
-    struct ggml_tensor *key_matrix = ggml_view_2d(ctx, kv.k_l[il],
-                                                  n_embd_head_k * n_head_kv, n_kv,
-                                                  ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa), 0);
-    cb(key_matrix, "key_matrix", il);
+    const int64_t ne0_key = k_cur->ne[0];
+    const int64_t ne1_key = k_cur->ne[1];
+    const int64_t ne2_key = k_cur->ne[2]; // sen_len or token_num
+    // const int64_t ne3_key = k_cur->ne[3];
+    ggml_tensor *key = ggml_reshape_2d(ctx, k_cur, ne0_key * ne2_key, ne1_key);
+    cb(key, "key", il);
 
     // key_matrix dim 4096 n_kv 1 1
     // const int64_t ne0_key = key_matrix->ne[0];
@@ -9830,7 +9828,7 @@ static std::pair<ggml_tensor*, ggml_tensor*> kv_resort(struct ggml_context * ctx
     // LLAMA_LOG_INFO("%s: key_matrix size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_key, ne1_key, ne2_key, ne3_key);
 
     // 计算K和Q的点积, (4096,n_kv,1,1) . (4096,1,1,1)
-    ggml_tensor *result = ggml_mul(ctx, key_matrix, query);
+    ggml_tensor *result = ggml_mul(ctx, key, query);
     // const int64_t ne0_result = result->ne[0];
     // const int64_t ne1_result = result->ne[1];
     // const int64_t ne2_result = result->ne[2];
@@ -9840,8 +9838,9 @@ static std::pair<ggml_tensor*, ggml_tensor*> kv_resort(struct ggml_context * ctx
 
     // result已經計算完4096*n_kv，現在要對n_kv進行page_size劃分，然後對原始的K和V進行掩碼處理
     int page_size = 32;
-    ggml_tensor *mask_kv = ggml_get_kv_mask(ctx, result, page_size);
-    return {nullptr, nullptr};
+    ggml_tensor *mask = ggml_get_kv_mask(ctx, result, page_size);
+    ggml_tensor *mask_kv = ggml_reshape_3d(ctx, mask, ne0_key, ne1_key, ne2_key);
+    return {mask_kv, mask_kv};
     // 對原始的KV進行掩碼處理
     // return {ggml_mask_kv(ctx, mask_kv, k_cur), ggml_mask_kv(ctx, mask_kv, v_cur)};
 }
@@ -9882,7 +9881,12 @@ static struct ggml_tensor * llm_build_kqv(
                 ggml_row_size(kv.k_l[il]->type, n_embd_head_k),
                 0);
     cb(k, "k", il);
-
+    // const int64_t ne0_key = k->ne[0];
+    // const int64_t ne1_key = k->ne[1];
+    // const int64_t ne2_key = k->ne[2];
+    // const int64_t ne3_key = k->ne[3];
+    // LLAMA_LOG_INFO("%s: key size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_key, ne1_key, ne2_key, ne3_key);
+    std::pair<ggml_tensor *, ggml_tensor *> mask_kv = kv_resort(ctx, graph, q, k, k, cb, il, kv);
     struct ggml_tensor * cur;
 
     if (cparams.flash_attn) {
@@ -9905,7 +9909,8 @@ static struct ggml_tensor * llm_build_kqv(
 
         cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
     } else {
-        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+        // struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, mask_kv.first, q); // TODO test
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
@@ -9996,12 +10001,7 @@ static struct ggml_tensor * llm_build_kv(
     ggml_build_forward_expand(graph, k_cur);
     ggml_build_forward_expand(graph, v_cur);
 
-    std::pair<ggml_tensor*, ggml_tensor*> mask_kv = kv_resort(ctx, graph,hparams, n_kv, q_cur, k_cur, v_cur, cb, il, kv);
-    if (mask_kv.first && mask_kv.second) {
-        llm_build_kv_store(ctx, hparams, cparams, kv, graph, mask_kv.first, mask_kv.second, n_tokens, kv_head, cb, il);
-    } else {
-        llm_build_kv_store(ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
-    }
+    llm_build_kv_store(ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
 
     struct ggml_tensor * cur;
 
