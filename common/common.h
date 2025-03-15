@@ -209,7 +209,7 @@ struct common_params {
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
-    float gpu_split = 0.3;
+    float gpu_split = 1.0f; // 修改默認參數爲1，保證推理精度
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 

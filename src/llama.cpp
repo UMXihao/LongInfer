@@ -2600,7 +2600,7 @@ struct llama_cparams {
 
     enum llama_pooling_type pooling_type;
 
-    float gpu_split = 0.3; // default 0.3 KV Caches join to inference
+    float gpu_split = 1.0f; // default 0.3 KV Caches join to inference
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
@@ -13528,7 +13528,7 @@ struct llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ 1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
-        /*.gpu_split                   =*/ 0.3f,
+        /*.gpu_split                   =*/ 1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
