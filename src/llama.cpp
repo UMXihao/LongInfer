@@ -2600,6 +2600,8 @@ struct llama_cparams {
 
     enum llama_pooling_type pooling_type;
 
+    float gpu_split = 0.3; // default 0.3 KV Caches join to inference
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };
@@ -3508,23 +3510,12 @@ static bool llama_kv_cache_init(
             return false;
         }
 
-        // TODO GPU percent
-        // int temp = (int)ceilf(kv_size * 0.3);
         ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*kv_size);
         ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*kv_size);
         ggml_format_name(k, "cache_k_l%d", i);
         ggml_format_name(v, "cache_v_l%d", i);
         cache.k_l.push_back(k);
         cache.v_l.push_back(v);
-
-        ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-        ggml_context * ctx_cpu = ctx_for_buft(cpu_buft);
-        ggml_tensor * k_cpu = ggml_new_tensor_1d(ctx_cpu, type_k, n_embd_k_gqa*kv_size);
-        ggml_tensor * v_cpu = ggml_new_tensor_1d(ctx_cpu, type_v, n_embd_v_gqa*kv_size);
-        ggml_format_name(k_cpu, "cache_k_l_c%d", i);
-        ggml_format_name(v_cpu, "cache_v_l_c%d", i);
-        cache.k_l_cpu.push_back(k_cpu);
-        cache.v_l_cpu.push_back(v_cpu);
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -9790,59 +9781,25 @@ static struct ggml_tensor * llm_build_moe_ffn(
     return moe_out;
 }
 
-// LongInfer
-static std::pair<ggml_tensor*, ggml_tensor*> kv_resort(struct ggml_context * ctx, struct ggml_cgraph * graph,
-    ggml_tensor *q_cur, ggml_tensor *k_cur, ggml_tensor *v_cur,
-    const llm_build_cb & cb, int il, const llama_kv_cache & kv) {
+static struct ggml_tensor * llama_kv_cache_trim(struct ggml_context *ctx, const llama_kv_cache &kv, const llm_build_cb &cb,
+                                struct ggml_tensor *k_cur, struct ggml_tensor *q_cur, int il) {
     // 從第二層開始進行稀疏處理
     if (il <= 2) {
-        return {nullptr, nullptr};
+        return nullptr;
     }
     // q_cur dim 128 sen_len 32 1
-    const int64_t ne0_query = q_cur->ne[0];
-    const int64_t ne1_query = q_cur->ne[1];
-    const int64_t ne2_query = q_cur->ne[2]; // sen_len or token_num
-    // const int64_t ne3_query = q_cur->ne[3];
-    // LLAMA_LOG_INFO("%s: query size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_query, ne1_query, ne2_query, ne3_query);
+    const int64_t ne0_query = kv.k_l[il]->ne[0];
+    const int64_t ne1_query = kv.k_l[il]->ne[1];
+    const int64_t ne2_query = kv.k_l[il]->ne[2];
+    const int64_t ne3_query = kv.k_l[il]->ne[3];
+    LLAMA_LOG_INFO("%s: query size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_query, ne1_query, ne2_query, ne3_query);
     if (ne1_query != 1) {
-        // 如果sen_len的维度是1，说明是解码阶段，仅有解码阶段进行计算
-        return {nullptr, nullptr};
+        // 如果sen_len的维度不是1說明是預填充階段，進行稀疏性分割
+        int64_t cur_size = ggml_nrows(kv.k_l[il]);
+        int64_t new_size = ceilf(cur_size * 0.3);
+        return ggml_view_1d(ctx, kv.k_l[il], new_size, 0);
     }
-
-    // Q转为1为数组
-    ggml_tensor *query = ggml_reshape_1d(ctx, q_cur, ne0_query * ne2_query);
-    cb(query, "query", il);
-
-    const int64_t ne0_key = k_cur->ne[0];
-    const int64_t ne1_key = k_cur->ne[1];
-    const int64_t ne2_key = k_cur->ne[2]; // sen_len or token_num
-    // const int64_t ne3_key = k_cur->ne[3];
-    ggml_tensor *key = ggml_reshape_2d(ctx, k_cur, ne0_key * ne2_key, ne1_key);
-    cb(key, "key", il);
-
-    // key_matrix dim 4096 n_kv 1 1
-    // const int64_t ne0_key = key_matrix->ne[0];
-    // const int64_t ne1_key = key_matrix->ne[1];
-    // const int64_t ne2_key = key_matrix->ne[2];
-    // const int64_t ne3_key = key_matrix->ne[3];
-    // LLAMA_LOG_INFO("%s: key_matrix size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_key, ne1_key, ne2_key, ne3_key);
-
-    // 计算K和Q的点积, (4096,n_kv,1,1) . (4096,1,1,1)
-    ggml_tensor *result = ggml_mul(ctx, key, query);
-    // const int64_t ne0_result = result->ne[0];
-    // const int64_t ne1_result = result->ne[1];
-    // const int64_t ne2_result = result->ne[2];
-    // const int64_t ne3_result = result->ne[3];
-    // LLAMA_LOG_INFO("%s: result size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_result, ne1_result, ne2_result, ne3_result);
-    ggml_build_forward_expand(graph, result);
-
-    // result已經計算完4096*n_kv，現在要對n_kv進行page_size劃分，然後對原始的K和V進行掩碼處理
-    int page_size = 32;
-    ggml_tensor *mask = ggml_get_kv_mask(ctx, result, page_size);
-    ggml_tensor *mask_kv = ggml_reshape_3d(ctx, mask, ne0_key, ne1_key, ne2_key);
-    return {mask_kv, mask_kv};
-    // 對原始的KV進行掩碼處理
-    // return {ggml_mask_kv(ctx, mask_kv, k_cur), ggml_mask_kv(ctx, mask_kv, v_cur)};
+    return nullptr;
 }
 
 static struct ggml_tensor * llm_build_kqv(
@@ -9870,23 +9827,24 @@ static struct ggml_tensor * llm_build_kqv(
     const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_head_v = hparams.n_embd_head_v;
     const int64_t n_embd_v_gqa  = hparams.n_embd_v_gqa(il);
+    const float gpu_split  = cparams.gpu_split;
 
+    // 128 1 32 1
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     cb(q, "q", il);
-
-    struct ggml_tensor * k =
-        ggml_view_3d(ctx, kv.k_l[il],
-                n_embd_head_k, n_kv, n_head_kv,
-                ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa),
-                ggml_row_size(kv.k_l[il]->type, n_embd_head_k),
-                0);
+    struct ggml_tensor * k;
+    // 對歷史產生的kv_self進行重新內存分配，新生成的依舊按照原來的方式追加
+    // struct ggml_tensor * tmp_kv = llama_kv_cache_trim(ctx, kv, cb, kv.k_l[il], q_cur, il);
+    // const int64_t ne1_query = q_cur->ne[2];
+    // 如果sen_len的维度1 解碼階段
+    int64_t sparse_kv = ceilf(n_kv * gpu_split);
+    k = ggml_view_3d(ctx, kv.k_l[il],
+            n_embd_head_k, sparse_kv, n_head_kv,
+            ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa),
+            ggml_row_size(kv.k_l[il]->type, n_embd_head_k),
+            0);
     cb(k, "k", il);
-    // const int64_t ne0_key = k->ne[0];
-    // const int64_t ne1_key = k->ne[1];
-    // const int64_t ne2_key = k->ne[2];
-    // const int64_t ne3_key = k->ne[3];
-    // LLAMA_LOG_INFO("%s: key size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_key, ne1_key, ne2_key, ne3_key);
-    std::pair<ggml_tensor *, ggml_tensor *> mask_kv = kv_resort(ctx, graph, q, k, k, cb, il, kv);
+
     struct ggml_tensor * cur;
 
     if (cparams.flash_attn) {
@@ -9909,8 +9867,7 @@ static struct ggml_tensor * llm_build_kqv(
 
         cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
     } else {
-        // struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
-        struct ggml_tensor * kq = ggml_mul_mat(ctx, mask_kv.first, q); // TODO test
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
@@ -9942,7 +9899,7 @@ static struct ggml_tensor * llm_build_kqv(
         // split cached v into n_head heads
         struct ggml_tensor * v =
             ggml_view_3d(ctx, kv.v_l[il],
-                    n_kv, n_embd_head_v, n_head_kv,
+                    sparse_kv, n_embd_head_v, n_head_kv,
                     ggml_element_size(kv.v_l[il])*n_ctx,
                     ggml_element_size(kv.v_l[il])*n_ctx*n_embd_head_v,
                     0);
@@ -10617,8 +10574,9 @@ struct llm_build_context {
     }
 
     struct ggml_tensor * build_inp_KQ_mask(bool causal = true) {
+        int64_t sparse_size = ceilf(n_kv * cparams.gpu_split);
         lctx.inp_KQ_mask = causal
-            ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
+            ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, sparse_size,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
             : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         cb(lctx.inp_KQ_mask, "KQ_mask", -1);
         ggml_set_input(lctx.inp_KQ_mask);
@@ -13570,6 +13528,7 @@ struct llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ 1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.gpu_split                   =*/ 0.3f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -13851,6 +13810,7 @@ struct llama_context * llama_new_context_with_model(
     cparams.flash_attn       = params.flash_attn;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
+    cparams.gpu_split     = params.gpu_split;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
