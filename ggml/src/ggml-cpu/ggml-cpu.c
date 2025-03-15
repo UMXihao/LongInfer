@@ -8793,36 +8793,6 @@ static void ggml_compute_forward_diag(
     }
 }
 
-static void ggml_compute_forward_get_kv_mask_f32(
-    const struct ggml_compute_params *params,
-    struct ggml_tensor *dst) {
-    const struct ggml_tensor * src0 = dst->src[0];
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    const int nr  = ggml_nrows(src0);
-
-    GGML_TENSOR_UNARY_OP_LOCALS
-
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int ir = ir0; ir < ir1; ++ir) {
-        // src1 is broadcastable across src0 and dst in i1, i2, i3
-        const int64_t i03 = ir/(ne02*ne01);
-        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
-        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
-
-        float * src0_ptr = (float *) ((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
-        * src0_ptr = 0;
-    }
-}
-
 // ggml_compute_forward_diag_mask_inf
 
 static void ggml_compute_forward_diag_mask_f32(
@@ -8908,24 +8878,6 @@ static void ggml_compute_forward_diag_mask_zero(
             {
                 GGML_ABORT("fatal error");
             }
-    }
-}
-
-static void ggml_compute_forward_get_kv_mask(
-        const struct ggml_compute_params * params,
-        struct ggml_tensor * dst) {
-
-    const struct ggml_tensor * src0 = dst->src[0];
-
-    switch (src0->type) {
-        case GGML_TYPE_F32:
-        {
-            ggml_compute_forward_get_kv_mask_f32(params, dst);
-        } break;
-        default:
-        {
-            GGML_ABORT("fatal error");
-        }
     }
 }
 
@@ -12560,10 +12512,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_diag_mask_zero(params, tensor);
             } break;
-        case GGML_OP_GET_KV_MASK:
-            {
-                ggml_compute_forward_get_kv_mask(params, tensor);
-            } break;
         case GGML_OP_SOFT_MAX:
             {
                 ggml_compute_forward_soft_max(params, tensor);
@@ -12931,7 +12879,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = 1;
             } break;
         case GGML_OP_DIAG_MASK_ZERO:
-        case GGML_OP_GET_KV_MASK:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SOFT_MAX_BACK:
         case GGML_OP_ROPE:

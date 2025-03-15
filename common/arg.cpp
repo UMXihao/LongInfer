@@ -1250,6 +1250,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
+        {"-gs", "--gpu=split"}, "N",
+        string_format("KV Caches involvaed in inference (default: %.1f)", (double)params.gpu_split),
+        [](common_params & params, const std::string & value) {
+            params.gpu_split = std::stof(value);
+        }
+        ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
         {"-dt", "--defrag-thold"}, "N",
         string_format("KV cache defragmentation threshold (default: %.1f, < 0 - disabled)", (double)params.defrag_thold),
         [](common_params & params, const std::string & value) {

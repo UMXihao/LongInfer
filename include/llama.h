@@ -328,6 +328,7 @@ extern "C" {
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // defragment the KV cache if holes/size > thold, < 0 disabled (default)
+        float    gpu_split;        // default 0.3 KV Caches join to inference
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;

@@ -974,7 +974,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_ADAMW",
 };
 
-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
+static_assert(GGML_OP_COUNT == 81, "GGML_OP_COUNT != 81");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1069,7 +1069,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "adamw(x)",
 };
 
-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
+static_assert(GGML_OP_COUNT == 81, "GGML_OP_COUNT != 81");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3385,29 +3385,6 @@ struct ggml_tensor * ggml_diag_mask_zero(
     return ggml_diag_mask_zero_impl(ctx, a, n_past, false);
 }
 
-static struct ggml_tensor * ggml_get_kv_mask_impl(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        int                   page_size,
-        bool                  inplace) {
-    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
-
-    int32_t params[] = { page_size };
-    ggml_set_op_params(result, params, sizeof(params));
-
-    result->op     = GGML_OP_GET_KV_MASK;
-    result->src[0] = a;
-
-    return result;
-}
-
-struct ggml_tensor* ggml_get_kv_mask(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        int                   page_size) {
-    return ggml_get_kv_mask_impl(ctx, a, page_size, false);
-}
-
 struct ggml_tensor * ggml_diag_mask_zero_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -5443,12 +5420,6 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 const int n_past = ((const int32_t *) tensor->op_params)[0];
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_diag_mask_zero_impl(ctx, grad, n_past, false));
-            }
-        } break;
-        case GGML_OP_GET_KV_MASK: {
-            if (src0_needs_grads) {
-                const int page_size = ((const int32_t *) tensor->op_params)[0];
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_get_kv_mask_impl(ctx, grad, page_size, false));
             }
         } break;
         case GGML_OP_SOFT_MAX: {
