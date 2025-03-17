@@ -1292,6 +1292,12 @@ extern "C" {
             int64_t               ne0,
             size_t                offset);
 
+    GGML_API struct ggml_tensor * ggml_view_1d_offset0(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int64_t               ne0,
+        size_t                offset);
+
     GGML_API struct ggml_tensor * ggml_view_2d(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

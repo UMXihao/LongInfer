@@ -3462,11 +3462,15 @@ static bool llama_kv_cache_init(
     cache.size = kv_size;
     cache.used = 0;
 
+    int64_t gpu_kv_size = ceilf(kv_size * cparams.gpu_split);
+    int64_t cpu_kv_size = kv_size - gpu_kv_size;
+
     cache.type_k = type_k;
     cache.type_v = type_v;
 
     cache.cells.clear();
-    cache.cells.resize(kv_size);
+    // cache.cells.resize(kv_size);
+    cache.cells.resize(gpu_kv_size); // 將GPU內存管理的大小修改爲30%
 
     // create a context for each buffer type
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
@@ -3510,12 +3514,28 @@ static bool llama_kv_cache_init(
             return false;
         }
 
-        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*kv_size);
-        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*kv_size);
+        // ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*kv_size);
+        // ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*kv_size);
+        // ggml_format_name(k, "cache_k_l%d", i);
+        // ggml_format_name(v, "cache_v_l%d", i);
+        // cache.k_l.push_back(k);
+        // cache.v_l.push_back(v);
+        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa*gpu_kv_size);
+        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa*gpu_kv_size);
         ggml_format_name(k, "cache_k_l%d", i);
         ggml_format_name(v, "cache_v_l%d", i);
         cache.k_l.push_back(k);
         cache.v_l.push_back(v);
+
+        ggml_backend_buffer_type_t buft_cpu = ggml_backend_cpu_buffer_type();
+        ggml_context * ctx_cpu = ctx_for_buft(buft_cpu);
+        // 創建CPU KV Cache的緩衝區
+        ggml_tensor * k_cpu = ggml_new_tensor_1d(ctx_cpu, type_k, n_embd_k_gqa*cpu_kv_size);
+        ggml_tensor * v_cpu = ggml_new_tensor_1d(ctx_cpu, type_v, n_embd_v_gqa*cpu_kv_size);
+        ggml_format_name(k_cpu, "cache_k_l_c%d", i);
+        ggml_format_name(v_cpu, "cache_v_l_c%d", i);
+        cache.k_l_cpu.push_back(k_cpu);
+        cache.v_l_cpu.push_back(v_cpu);
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -9439,17 +9459,46 @@ static void llm_build_kv_store(
     const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
     GGML_ASSERT(kv.size == n_ctx);
+    if (n_tokens != 1) {
+        LLAMA_LOG_INFO("k_cur->ne[0]: %ld, k_cur->ne[1]: %ld, k_cur->ne[2]: %ld, k_cur->ne[3]: %ld, kv_head: %d\n", k_cur->ne[0], k_cur->ne[1], k_cur->ne[2], k_cur->ne[3], kv_head);
+    }
+    // 預填充階段： 将30%张量存储到kv.k_l[il]， 70%存储到kv.k_l_cpu[il]
+    if (n_tokens != 1 && kv_head <= 4096) {
+        // 預填充階段生成的張量首次添加到buffer，初始偏移值爲0
+        int64_t gpu_tokens = ceilf(cparams.gpu_split * n_tokens);
+        int64_t cpu_tokens = n_tokens - gpu_tokens;
+        // LLAMA_LOG_INFO("n_tokens: %ld, gpu_tokens: %ld, cpu_tokens: %ld\n", n_tokens, gpu_tokens, cpu_tokens);
+        // 每個批次是512，原先的kv_head，每次增加512個
+        int64_t gpu_kv_head = ceilf(cparams.gpu_split * kv_head);
+        int64_t cpu_kv_head = kv_head - gpu_kv_head;
+        // LLAMA_LOG_INFO("k_cur->ne[0]: %ld, kv_head: %d, gpu_kv_head: %ld, cpu_kv_head: %ld\n",k_cur->ne[0], kv_head, gpu_kv_head, cpu_kv_head);
+        struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], gpu_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa)*gpu_kv_head);
+        cb(k_cache_view, "k_cache_view", il);
+        struct ggml_tensor * k_cache_view_cpu = ggml_view_1d(ctx, kv.k_l_cpu[il], cpu_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa)*cpu_kv_head);
+        cb(k_cache_view_cpu, "k_cache_view_cpu", il);
 
-    struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa)*kv_head);
-    cb(k_cache_view, "k_cache_view", il);
-
-    // 重新设置kv.k_l[il]和kv.v_l[il]参与当前K和V的运算，并且将其余kv转移到CPU
-    // 判断是解码阶段才进行参数转移
-    // TODO 将30%张量存储到kv.k_l[il]， 70%存储到kv.k_l_cpu[il]
+        // k_cur需要拆分成兩個張量
+        struct ggml_tensor * k_cur_gpu = ggml_view_1d(ctx, k_cur, gpu_tokens*n_embd_k_gqa, 0);
+        cb(k_cur_gpu, "k_cur_gpu", il);
+        struct ggml_tensor * k_cur_cpu = ggml_view_1d(ctx, k_cur, cpu_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l_cpu[il]->type, n_embd_k_gqa)*gpu_kv_head);
+        cb(k_cur_cpu, "k_cur_cpu", il);
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur_gpu, k_cache_view));
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cache_view_cpu, k_cache_view_cpu));
+    } else {
+        int64_t gpu_kv_head = ceilf(cparams.gpu_split * kv_head);
+        struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa)*gpu_kv_head);
+        cb(k_cache_view, "k_cache_view", il);
+        // note: storing RoPE-ed version of K in the KV cache
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur, k_cache_view));
+    }
+    // if (n_tokens != 1) {
+    //     LLAMA_LOG_INFO("k_cur->ne[0]: %ld, k_cur->ne[1]: %ld, k_cur->ne[2]: %ld, k_cur->ne[3]: %ld, kv_head: %d\n", k_cur->ne[0], k_cur->ne[1], k_cur->ne[2], k_cur->ne[3], kv_head);
+    // }
+    // struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa)*kv_head);
+    // cb(k_cache_view, "k_cache_view", il);
 
     // note: storing RoPE-ed version of K in the KV cache
-    ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur, k_cache_view));
-
+    // ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur, k_cache_view));
     assert(v_cur->ne[0] == n_embd_v_gqa && v_cur->ne[1] == n_tokens);
 
     struct ggml_tensor * v_cache_view = nullptr;
@@ -9781,26 +9830,26 @@ static struct ggml_tensor * llm_build_moe_ffn(
     return moe_out;
 }
 
-static struct ggml_tensor * llama_kv_cache_trim(struct ggml_context *ctx, const llama_kv_cache &kv, const llm_build_cb &cb,
-                                struct ggml_tensor *k_cur, struct ggml_tensor *q_cur, int il) {
-    // 從第二層開始進行稀疏處理
-    if (il <= 2) {
-        return nullptr;
-    }
-    // q_cur dim 128 sen_len 32 1
-    const int64_t ne0_query = kv.k_l[il]->ne[0];
-    const int64_t ne1_query = kv.k_l[il]->ne[1];
-    const int64_t ne2_query = kv.k_l[il]->ne[2];
-    const int64_t ne3_query = kv.k_l[il]->ne[3];
-    LLAMA_LOG_INFO("%s: query size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_query, ne1_query, ne2_query, ne3_query);
-    if (ne1_query != 1) {
-        // 如果sen_len的维度不是1說明是預填充階段，進行稀疏性分割
-        int64_t cur_size = ggml_nrows(kv.k_l[il]);
-        int64_t new_size = ceilf(cur_size * 0.3);
-        return ggml_view_1d(ctx, kv.k_l[il], new_size, 0);
-    }
-    return nullptr;
-}
+// static struct ggml_tensor * llama_kv_cache_trim(struct ggml_context *ctx, const llama_kv_cache &kv, const llm_build_cb &cb,
+//                                 struct ggml_tensor *k_cur, struct ggml_tensor *q_cur, int il) {
+//     // 從第二層開始進行稀疏處理
+//     if (il <= 2) {
+//         return nullptr;
+//     }
+//     // q_cur dim 128 sen_len 32 1
+//     const int64_t ne0_query = kv.k_l[il]->ne[0];
+//     const int64_t ne1_query = kv.k_l[il]->ne[1];
+//     const int64_t ne2_query = kv.k_l[il]->ne[2];
+//     const int64_t ne3_query = kv.k_l[il]->ne[3];
+//     LLAMA_LOG_INFO("%s: query size ne0 %ld, ne1 %ld, ne2 %ld, ne3 %ld\n", __func__, ne0_query, ne1_query, ne2_query, ne3_query);
+//     if (ne1_query != 1) {
+//         // 如果sen_len的维度不是1說明是預填充階段，進行稀疏性分割
+//         int64_t cur_size = ggml_nrows(kv.k_l[il]);
+//         int64_t new_size = ceilf(cur_size * 0.3);
+//         return ggml_view_1d(ctx, kv.k_l[il], new_size, 0);
+//     }
+//     return nullptr;
+// }
 
 static struct ggml_tensor * llm_build_kqv(
         struct ggml_context * ctx,
@@ -9827,7 +9876,7 @@ static struct ggml_tensor * llm_build_kqv(
     const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_head_v = hparams.n_embd_head_v;
     const int64_t n_embd_v_gqa  = hparams.n_embd_v_gqa(il);
-    const float gpu_split  = cparams.gpu_split;
+    // const float gpu_split  = cparams.gpu_split;
 
     // 128 1 32 1
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
@@ -9837,9 +9886,9 @@ static struct ggml_tensor * llm_build_kqv(
     // struct ggml_tensor * tmp_kv = llama_kv_cache_trim(ctx, kv, cb, kv.k_l[il], q_cur, il);
     // const int64_t ne1_query = q_cur->ne[2];
     // 如果sen_len的维度1 解碼階段
-    int64_t sparse_kv = ceilf(n_kv * gpu_split);
+    // int64_t sparse_kv = ceilf(n_kv * gpu_split);
     k = ggml_view_3d(ctx, kv.k_l[il],
-            n_embd_head_k, sparse_kv, n_head_kv,
+            n_embd_head_k, n_kv, n_head_kv,
             ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa),
             ggml_row_size(kv.k_l[il]->type, n_embd_head_k),
             0);
@@ -9899,7 +9948,7 @@ static struct ggml_tensor * llm_build_kqv(
         // split cached v into n_head heads
         struct ggml_tensor * v =
             ggml_view_3d(ctx, kv.v_l[il],
-                    sparse_kv, n_embd_head_v, n_head_kv,
+                    n_kv, n_embd_head_v, n_head_kv,
                     ggml_element_size(kv.v_l[il])*n_ctx,
                     ggml_element_size(kv.v_l[il])*n_ctx*n_embd_head_v,
                     0);
@@ -10574,9 +10623,9 @@ struct llm_build_context {
     }
 
     struct ggml_tensor * build_inp_KQ_mask(bool causal = true) {
-        int64_t sparse_size = ceilf(n_kv * cparams.gpu_split);
+        // int64_t sparse_size = ceilf(n_kv * cparams.gpu_split);
         lctx.inp_KQ_mask = causal
-            ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, sparse_size,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
+            ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
             : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         cb(lctx.inp_KQ_mask, "KQ_mask", -1);
         ggml_set_input(lctx.inp_KQ_mask);

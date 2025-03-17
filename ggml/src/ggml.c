@@ -1623,6 +1623,100 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     return result;
 }
 
+static struct ggml_tensor * ggml_new_tensor_impl_offset0(
+        struct ggml_context * ctx,
+        enum   ggml_type      type,
+        int                   n_dims,
+        const int64_t       * ne,
+        struct ggml_tensor  * view_src,
+        size_t                view_offs) {
+
+    GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT);
+    GGML_ASSERT(n_dims >= 1 && n_dims <= GGML_MAX_DIMS);
+
+    // find the base tensor and absolute offset
+    if (view_src != NULL && view_src->view_src != NULL) {
+        view_src   = view_src->view_src;
+    }
+
+    size_t data_size = ggml_row_size(type, ne[0]);
+    for (int i = 1; i < n_dims; i++) {
+        data_size *= ne[i];
+    }
+
+    GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));
+
+    void * data = view_src != NULL ? view_src->data : NULL;
+    if (data != NULL) {
+        data = (char *) data + view_offs;
+    }
+
+    size_t obj_alloc_size = 0;
+
+    if (view_src == NULL && !ctx->no_alloc) {
+        // allocate tensor data in the context's memory pool
+        obj_alloc_size = data_size;
+    }
+
+    struct ggml_object * const obj_new = ggml_new_object(ctx, GGML_OBJECT_TYPE_TENSOR, GGML_TENSOR_SIZE + obj_alloc_size);
+    GGML_ASSERT(obj_new);
+
+    struct ggml_tensor * const result = (struct ggml_tensor *)((char *)ctx->mem_buffer + obj_new->offs);
+
+#ifdef __clang__
+    // temporary until ggml_tensor::backend is removed
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+    *result = (struct ggml_tensor) {
+        /*.type         =*/ type,
+        /*.backend      =*/ GGML_BACKEND_TYPE_CPU,
+        /*.buffer       =*/ NULL,
+        /*.ne           =*/ { 1, 1, 1, 1 },
+        /*.nb           =*/ { 0, 0, 0, 0 },
+        /*.op           =*/ GGML_OP_NONE,
+        /*.op_params    =*/ { 0 },
+        /*.flags        =*/ 0,
+        /*.src          =*/ { NULL },
+        /*.view_src     =*/ view_src,
+        /*.view_offs    =*/ view_offs,
+        /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
+        /*.name         =*/ { 0 },
+        /*.extra        =*/ NULL,
+        /*.padding      =*/ { 0 },
+    };
+
+#ifdef __clang__
+    #pragma clang diagnostic pop
+#endif
+
+    // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
+    //GGML_ASSERT_ALIGNED(result->data);
+
+    for (int i = 0; i < n_dims; i++) {
+        result->ne[i] = ne[i];
+    }
+
+    result->nb[0] = ggml_type_size(type);
+    result->nb[1] = result->nb[0]*(result->ne[0]/ggml_blck_size(type));
+    for (int i = 2; i < GGML_MAX_DIMS; i++) {
+        result->nb[i] = result->nb[i - 1]*result->ne[i - 1];
+    }
+
+    ctx->n_objects++;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_new_tensor_offset0(
+        struct ggml_context * ctx,
+        enum   ggml_type      type,
+        int                   n_dims,
+        const int64_t       * ne) {
+    return ggml_new_tensor_impl_offset0(ctx, type, n_dims, ne, NULL, 0);
+}
+
 struct ggml_tensor * ggml_new_tensor(
         struct ggml_context * ctx,
         enum   ggml_type      type,
@@ -3113,6 +3207,23 @@ static struct ggml_tensor * ggml_view_impl(
     return result;
 }
 
+static struct ggml_tensor * ggml_view_impl_offset0(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_dims,
+        const int64_t       * ne,
+        size_t                offset) {
+    struct ggml_tensor * result = ggml_new_tensor_impl_offset0(ctx, a->type, n_dims, ne, a, offset);
+    ggml_format_name(result, "%s (view)", a->name);
+
+    ggml_set_op_params(result, &offset, sizeof(offset));
+
+    result->op     = GGML_OP_VIEW;
+    result->src[0] = a;
+
+    return result;
+}
+
 // ggml_view_1d
 
 struct ggml_tensor * ggml_view_1d(
@@ -3121,6 +3232,16 @@ struct ggml_tensor * ggml_view_1d(
         int64_t               ne0,
         size_t                offset) {
     struct ggml_tensor * result = ggml_view_impl(ctx, a, 1, &ne0, offset);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_view_1d_offset0(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int64_t               ne0,
+        size_t                offset) {
+    struct ggml_tensor * result = ggml_view_impl_offset0(ctx, a, 1, &ne0, offset);
 
     return result;
 }
