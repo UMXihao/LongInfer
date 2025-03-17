@@ -2804,7 +2804,8 @@ struct llama_kv_page {
     bool is_on_gpu;                    // 页面是否分配在 GPU 上
 };
 
-// ring-buffer of cached KV data
+
+// page-buffer of cached KV data
 struct llama_kv_cache {
     bool has_shift = false;
     bool do_defrag = false;
@@ -2825,6 +2826,8 @@ struct llama_kv_cache {
     ggml_type type_v = GGML_TYPE_F16;
 
     std::vector<llama_kv_cell> cells;
+    uint32_t page_size = 32;
+    std::vector<llama_kv_page> pages;
 
     uint32_t page_size = 32;
     std::vector<llama_kv_page> pages;
@@ -3454,6 +3457,7 @@ static bool llama_kv_cache_init(
     const int64_t  n_layer = hparams.n_layer;
 
     cache.has_shift = false;
+    cache.size = kv_size;
 
     cache.recurrent = llama_model_is_recurrent(&model);
     cache.v_trans   = !cache.recurrent && !cparams.flash_attn;
@@ -3501,14 +3505,15 @@ static bool llama_kv_cache_init(
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
 
         ggml_backend_buffer_type_t buft;
+        // 默认的kv缓存位置
         if (offload) {
             auto * dev = model.dev_layer.at(i).dev;
             buft = ggml_backend_dev_buffer_type(dev);
         } else {
             buft = ggml_backend_cpu_buffer_type();
         }
-        ggml_context * ctx = ctx_for_buft(buft);
 
+        ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
             LLAMA_LOG_ERROR("%s: failed to create ggml context for kv cache\n", __func__);
             return false;
@@ -11766,7 +11771,8 @@ static int llama_decode_internal(
 
         // non-causal masks do not use the KV cache
         if (hparams.causal_attn) {
-            // llama_kv_cache_update(&lctx);
+
+            llama_kv_cache_update(&lctx);
 
             // if we have enough unused cells before the current head ->
             //   better to start searching from the beginning of the cache, hoping to fill it
@@ -11789,8 +11795,6 @@ static int llama_decode_internal(
                 //kv_self.n = llama_kv_cache_cell_max(kv_self);
             }
         }
-
-        //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
 
         ggml_backend_sched_reset(lctx.sched.get());
         ggml_backend_sched_set_eval_callback(lctx.sched.get(), lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
@@ -14070,7 +14074,6 @@ struct llama_context * llama_new_context_with_model(
 
             // buffer used to store the computation graph and the tensor meta data
             ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
-
             // TODO: move these checks to ggml_backend_sched
             // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
             bool pipeline_parallel =
